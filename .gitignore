@@ -1,0 +1,21 @@
+# 端到端测试产物
+tests/_*.webm
+tests/_*.png
+tests/_*.json
+*.raw.webm
+*.webm.report.json
+recovered*.webm
+broken*.webm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
