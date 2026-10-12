@@ -13,8 +13,10 @@ webm_recover —— 浏览器 MediaRecorder 录像的 WebM/Matroska 头部丢失
 用法:
     python recover.py <损坏的源文件> <输出文件> [--ffmpeg PATH] [--keep-raw]
 
-ffmpeg 解析顺序：--ffmpeg 参数 > 环境变量 WEBM_RECOVER_FFMPEG > PATH 中的 ffmpeg。
-退出码：0 成功；2 找不到可验证的 Cluster；3 ffmpeg 规范化失败（此时 .raw.webm 保留可查）。
+ffmpeg 解析顺序：--ffmpeg 参数 > 环境变量 WEBM_RECOVER_FFMPEG > PATH 中的 ffmpeg；
+--ffmpeg 显式指定的路径不存在时直接报错，不会悄悄退回 PATH。
+退出码：0 成功；1 路径/参数用法错（源不存在、是目录、空文件、输出目录不存在、指定的 ffmpeg 不存在）；
+        2 找不到可验证的 Cluster（或簇链里没有块）；3 ffmpeg 规范化失败（此时 .raw.webm 保留可查）。
 """
 import argparse
 import collections
@@ -32,7 +34,17 @@ UNKNOWN_SEGMENT = bytes.fromhex("01ffffffffffffff")
 
 def find_ffmpeg(cli=None):
     """按 --ffmpeg > 环境变量 > PATH 的顺序定位 ffmpeg，绝不回退到某个人的绝对路径。"""
-    for cand in (cli, os.environ.get("WEBM_RECOVER_FFMPEG"), shutil.which("ffmpeg")):
+    if cli:
+        # 用户显式指定了路径就必须真的用它：不存在要报错，不能悄悄改用 PATH 里的那个
+        if os.path.isabs(cli):
+            if os.path.exists(cli):
+                return cli
+        else:
+            found = shutil.which(cli)
+            if found:
+                return found
+        raise SystemExit("--ffmpeg 指定的 ffmpeg 不存在: %s" % cli)
+    for cand in (os.environ.get("WEBM_RECOVER_FFMPEG"), shutil.which("ffmpeg")):
         if not cand:
             continue
         if os.path.isabs(cand):
@@ -63,6 +75,29 @@ def vint(b, p):
                 v = (v << 8) | b[p + q]
             return v, L
     return None, 0
+
+
+def read_vint(b, p, n):
+    """带边界的 vint：损坏文件常见长度标记非法（0x00-0x0F）或字段越过文件尾。
+    这些情况一律返回 (None, 0)，让调用方按「这里断了」处理，而不是拿 None 去算偏移崩栈。"""
+    if p >= n:
+        return None, 0
+    x = b[p]
+    for k in range(8):
+        if x & (0x80 >> k):
+            L = k + 1
+            if p + L > n:                      # 长度字段本身就写在边界之外
+                return None, 0
+            v = x & (0xFF >> L)
+            for q in range(1, L):
+                v = (v << 8) | b[p + q]
+            return v, L
+    return None, 0
+
+
+def next_candidate(cands, p, n):
+    """链在这里断了：跳到下一个 Cluster 候选重新对齐，没有就走到文件尾。"""
+    return min((c for c in cands if c > p), default=n)
 
 
 def enc_size(v):
@@ -109,9 +144,14 @@ def main():
 
     if not os.path.exists(a.src):
         raise SystemExit("源文件不存在: %s" % a.src)
+    if os.path.isdir(a.src):                   # 传了目录时给出人话，而不是 IsADirectoryError
+        raise SystemExit("源路径是目录，不是文件: %s" % a.src)
     n = os.path.getsize(a.src)
     if n == 0:
         raise SystemExit("源文件为空")
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(out_dir):             # 输出目录不存在时提前拦住，别等到写中间产物才崩
+        raise SystemExit("输出文件的目录不存在: %s" % out_dir)
 
     f = open(a.src, "rb")
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -137,11 +177,13 @@ def main():
         """真 Cluster：unknown-size 头 + 紧跟 E7 Timestamp -> (块起点, 时间码)"""
         if o + 13 > n or mm[o + 4] != 0x01:
             return None
-        sv, ssz = vint(mm, o + 4)
+        sv, ssz = read_vint(mm, o + 4, n)
         p = o + 4 + ssz
         if p >= n or mm[p] != 0xE7:
             return None
-        tv, tsz = vint(mm, p + 1)
+        tv, tsz = read_vint(mm, p + 1, n)
+        if tv is None or p + 1 + tsz + tv > n:      # E7 后截断/长度标记非法：不算真簇
+            return None
         return p + 1 + tsz + tv, int.from_bytes(mm[p + 1 + tsz:p + 1 + tsz + tv], "big")
 
     start = None
@@ -165,7 +207,7 @@ def main():
             v = verify(p)
             if not v:
                 gaps.append(p)
-                p = min((c for c in cands if c > p), default=n)
+                p = next_candidate(cands, p, n)
                 continue
             cur = dict(off=p, ts=v[1], blocks=0, end=p)
             chains.append(cur)
@@ -173,15 +215,25 @@ def main():
             continue
         b = mm[p]
         if b == 0xE7:
-            tv, tsz = vint(mm, p + 1)
+            tv, tsz = read_vint(mm, p + 1, n)
+            if tv is None or p + 1 + tsz + tv > n:  # 时间码写歪或被截断：断链，重新对齐
+                gaps.append(p)
+                p = next_candidate(cands, p, n)
+                continue
             if cur is not None:
                 cur["ts"] = int.from_bytes(mm[p + 1 + tsz:p + 1 + tsz + tv], "big")
             p = p + 1 + tsz + tv
             continue
         if b == 0xA3:
-            sv, ssz = vint(mm, p + 1)
+            sv, ssz = read_vint(mm, p + 1, n)
             body = p + 1 + ssz
-            tk, tks = vint(mm, body)
+            tk, tks = read_vint(mm, body, n) if sv is not None else (None, 0)
+            # 块头必须自洽：有轨道号、至少装得下 2 字节相对时间码 + 1 字节 flags、且不越文件尾
+            if (sv is None or tk is None or tks == 0 or tk < 1 or sv < tks + 3
+                    or body + sv > n):
+                gaps.append(p)
+                p = next_candidate(cands, p, n)
+                continue
             rts = int.from_bytes(mm[body + tks:body + tks + 2], "big")
             flags = mm[body + tks + 2]
             fo, flen = body + tks + 3, body + sv - (body + tks + 3)
@@ -200,7 +252,7 @@ def main():
             p = body + sv
             continue
         gaps.append(p)
-        nxt = min((c for c in cands if c > p), default=n)
+        nxt = next_candidate(cands, p, n)
         if nxt <= p:
             break
         p = nxt
@@ -209,6 +261,11 @@ def main():
         mm.close()
         f.close()
         print("Cluster 链为空，无法重建。")
+        raise SystemExit(2)
+    if not track_blocks:
+        mm.close()
+        f.close()
+        print("簇链里一个 SimpleBlock 都没有（%d 个簇全空），没有可恢复的音视频数据。" % len(chains))
         raise SystemExit(2)
 
     tsl = [c["ts"] for c in chains]
@@ -257,28 +314,38 @@ def main():
         while p < n - 8:
             if mm[p:p + 4] == CID:
                 if not verify(p):
-                    nxt = min((c for c in cands if c > p), default=n)
+                    nxt = next_candidate(cands, p, n)
                     skipped += nxt - p
                     p = nxt
                     continue
-                sv, ssz = vint(mm, p + 4)
+                sv, ssz = read_vint(mm, p + 4, n)
                 o.write(CID + (UNKNOWN_SEGMENT if mm[p + 4] == 0x01 else enc_size(sv)))
                 p += 4 + ssz
                 ncl += 1
                 continue
             b = mm[p]
             if b == 0xE7:
-                tv, tsz = vint(mm, p + 1)
+                tv, tsz = read_vint(mm, p + 1, n)
+                if tv is None or p + 1 + tsz + tv > n:   # 与扫描阶段同判据：坏头就跳过，不写出脏元素
+                    nxt = next_candidate(cands, p, n)
+                    skipped += nxt - p
+                    p = nxt
+                    continue
                 ts = max(0, int.from_bytes(mm[p + 1 + tsz:p + 1 + tsz + tv], "big") - base)
                 o.write(el("e7", ts.to_bytes(tv, "big")))
                 p = p + 1 + tsz + tv
                 continue
             if b == 0xA3:
-                sv, ssz = vint(mm, p + 1)
+                sv, ssz = read_vint(mm, p + 1, n)
+                if sv is None or p + 1 + ssz + sv > n:
+                    nxt = next_candidate(cands, p, n)
+                    skipped += nxt - p
+                    p = nxt
+                    continue
                 o.write(mm[p:p + 1 + ssz + sv])
                 p = p + 1 + ssz + sv
                 continue
-            nxt = min((c for c in cands if c > p), default=n)
+            nxt = next_candidate(cands, p, n)
             if nxt <= p:
                 break
             skipped += nxt - p

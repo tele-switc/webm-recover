@@ -2,7 +2,7 @@
 """只读体检：数 Cluster / 顺解全链 / 采集轨道事实 / 判断头部损毁类型。不写任何文件。
 用法: python tools/dryrun.py <file1> [file2 ...]
 """
-import mmap, sys, collections
+import mmap, os, sys, collections
 
 try:                       # Windows GBK 控制台下打印中文不炸
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -24,9 +24,37 @@ def vint(b, p):
     return None, 0
 
 
+def read_vint(b, p, n):
+    """带边界的 vint：损坏文件里长度标记可能非法（0x00-0x0F）或字段越过文件尾，
+    这时返回 (None, 0)，让上层按「链断了」处理，而不是拿 None 去算偏移崩栈。"""
+    if p >= n:
+        return None, 0
+    x = b[p]
+    for k in range(8):
+        if x & (0x80 >> k):
+            L = k + 1
+            if p + L > n:
+                return None, 0
+            v = x & (0xFF >> L)
+            for q in range(1, L):
+                v = (v << 8) | b[p + q]
+            return v, L
+    return None, 0
+
+
 def probe(path):
     print("=" * 78)
     print(path)
+    # 体检是新手的第一步：路径问题要用中文说清楚，别抛 ValueError: cannot mmap an empty file
+    if not os.path.exists(path):
+        print("!! 文件不存在（检查路径有没有打错，注意用真实文件名）")
+        return
+    if os.path.isdir(path):
+        print("!! 这是目录，要给具体的 .webm 文件名")
+        return
+    if os.path.getsize(path) == 0:
+        print("!! 文件是空的（0 字节），没有任何数据可救")
+        return
     f = open(path, "rb")
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     n = len(mm)
@@ -46,11 +74,13 @@ def probe(path):
     def verify(o):
         if o + 13 > n or mm[o + 4] != 0x01:
             return None
-        sv, ssz = vint(mm, o + 4)
+        sv, ssz = read_vint(mm, o + 4, n)
         p = o + 4 + ssz
         if p >= n or mm[p] != 0xE7:
             return None
-        tv, tsz = vint(mm, p + 1)
+        tv, tsz = read_vint(mm, p + 1, n)
+        if tv is None or p + 1 + tsz + tv > n:
+            return None
         return p + 1 + tsz + tv, int.from_bytes(mm[p + 1 + tsz:p + 1 + tsz + tv], "big")
 
     start = None
@@ -94,15 +124,30 @@ def probe(path):
             continue
         b = mm[p]
         if b == 0xE7:
-            tv, tsz = vint(mm, p + 1)
+            tv, tsz = read_vint(mm, p + 1, n)
+            if tv is None or p + 1 + tsz + tv > n:
+                gaps.append(p)
+                nxt = min((c for c in cands if c > p), default=n)
+                if nxt <= p:
+                    break
+                p = nxt
+                continue
             if cur is not None:
                 cur["ts"] = int.from_bytes(mm[p + 1 + tsz:p + 1 + tsz + tv], "big")
             p = p + 1 + tsz + tv
             continue
         if b == 0xA3:
-            sv, ssz = vint(mm, p + 1)
+            sv, ssz = read_vint(mm, p + 1, n)
             body = p + 1 + ssz
-            tk, tks = vint(mm, body)
+            tk, tks = read_vint(mm, body, n) if sv is not None else (None, 0)
+            if (sv is None or tk is None or tks == 0 or tk < 1 or sv < tks + 3
+                    or body + sv > n):      # 块头自洽性检查：不满足就当断点跳过，不再拿 None 运算
+                gaps.append(p)
+                nxt = min((c for c in cands if c > p), default=n)
+                if nxt <= p:
+                    break
+                p = nxt
+                continue
             rts = int.from_bytes(mm[body + tks:body + tks + 2], "big")
             flags = mm[body + tks + 2]
             fo, flen = body + tks + 3, body + sv - (body + tks + 3)
@@ -148,6 +193,10 @@ def probe(path):
     print("   簇时间码逆序 %d 次；簇间隔 min %s / max %s ms" % (mono, min(dts) if dts else "-", max(dts) if dts else "-"))
     mm.close(); f.close()
 
+
+if len(sys.argv) < 2:                 # 和 tools/dump_ebml.py 一致：不给参数就说用法，别默默退出
+    print("用法: python tools/dryrun.py <file1> [file2 ...]")
+    raise SystemExit(2)
 
 for pth in sys.argv[1:]:
     try:
