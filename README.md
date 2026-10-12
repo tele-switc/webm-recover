@@ -38,30 +38,37 @@ python recover.py 损坏.webm 恢复.webm
 ```
 
 ffmpeg 按 `--ffmpeg` > 环境变量 `WEBM_RECOVER_FFMPEG` > `PATH` 的顺序找，没有内置任何人的绝对路径。
+`--ffmpeg` 指定的路径不存在会直接报错退出，不会悄悄改用 PATH 里的另一个 ffmpeg。
 
 流程：扫 Cluster 链 → 从 VP8 关键帧头里读出真实宽高 → 重建 EBML/Info/Tracks →
 时间码整体归零 → 让 `ffmpeg -c copy` 规范化容器（不重编码，画质无损）。
 
-跑完会得到 `恢复.webm.report.json`，里面是本次恢复的实测数字（簇数、块数、时长、跨度）。
+跑完会得到 `恢复.webm.report.json`，里面是本次恢复的实测数字（簇数、块数、判定的视频轨/音频轨、
+时长、跨度）。
 报告里的 `src` 只写文件名，不写你的绝对路径。
 
 验证是否真的可用：
 
 ```bash
-ffprobe -v error -show_entries stream=codec_type,duration 恢复.webm
+ffprobe -v error -show_entries stream=codec_type:format=duration 恢复.webm
 ```
+
+（写成 `stream=codec_type,duration` 也行，但每条流的 duration 会显示 `N/A`，
+时长只在 `format=duration` 这一项里。）
 
 ## 它假设了什么（不对上就别指望）
 
 这些是 MediaRecorder 的写法，不是所有 WebM 都长这样：
 
-1. **簇是 unknown-size**（`1F43B675` 后跟 `01 FF FF FF FF FF FF`）+ 紧跟 `E7` Timestamp。
+1. **簇是 unknown-size**（`1F43B675` 后跟 `01 FF FF FF FF FF FF FF`，1 字节长度标记 + 7 个 `FF`）
+   + 紧跟 `E7` Timestamp。
    ffmpeg 直接封装的文件用的是已知大小簇，本工具会拒绝（退出码 2）而不是硬造一个坏文件。
 2. **块是 SimpleBlock（`A3`）**，不是 `BlockGroup > Block`。
-3. **轨道 1 = 视频（VP8），轨道 2 = 音频（Opus 48kHz 立体声）**。
-   Tracks 里的 `CodecPrivate` 是按这个规格写死的 `OpusHead`；如果你录的是 H.264、
-   或者音频不是 48k 立体声，恢复出来的容器会跟真实负载不符——这时先跑 `tools/dump_ebml.py`
-   看原文件到底怎么写的，再决定要不要改 `recover.py` 里的 `vte`/`ate`。
+3. **轨道 1 = 视频（VP8），轨道 2 = 音频（Opus 48kHz 立体声）**——但轨道角色现在按证据认：
+   有 VP8 关键帧魔数的轨算视频轨；只开麦的纯音频录像（只有 Opus 一轨）会被建成纯音频容器，
+   不再凭空造一条空的 VP8 视频轨。Tracks 里的 `CodecPrivate` 仍是按 48kHz 立体声写死的
+   `OpusHead`；如果你录的是 H.264、或者音频不是 48k 立体声，恢复出来的容器会跟真实负载不符——
+   这时先跑 `tools/dump_ebml.py` 看原文件到底怎么写的，再决定要不要改 `recover.py` 里的 `vte`/`ate`。
 4. **不重建 Cues / SeekHead / Chapters**。播放器按顺序读没问题，但拖动进度条可能定位不准。
 5. 一次录制对应一个文件。多段课堂录制的时间码是连续递增的，需要自己按段拼接。
 
@@ -78,19 +85,24 @@ MediaRecorder 的流式结构，再剥掉容器头、前面塞垃圾字节，然
 最后用 ffprobe 核对轨道/时长，并**真的解出一帧 PNG** 确认不是空壳。
 没有 ffmpeg 时端到端用例自动 skip，不会假装通过。
 
-当前本机实测：10 项全过（EBML 编码往返、轨道号回归、样本结构、端到端恢复、
-解码出真实帧、报告不含绝对路径、CLI 错误路径）。
+当前本机实测（Python 3.14 + ffmpeg 9）：18 项全过（EBML 编码往返、带边界的 vint 读取、
+轨道号回归、样本结构、端到端恢复、解码出真实帧、纯音频输入不被造出视频轨、
+报告不含绝对路径、CLI 错误路径、非法长度标记与截断尾不崩栈、体检工具的坏路径提示）。
+没有 ffmpeg 时其中 5 项 skip，其余 13 项照跑。
 
 `fixtures/` 里两个参考文件是 ffmpeg 生成的约 1 秒合成片段，只作 EBML 结构参照，
 不含任何真实录音录像。
 
-## EBML 的两个坑（本工具踩过，写在这里省你时间）
+## EBML 的几个坑（本工具踩过，写在这里省你时间）
 
 - 整数元素值带**长度 marker**：track 1 编码成 `0x81`，不是 `0x01`。
   写成 `0x01` 会被解析成"后面还有 8 字节长度"，于是吞掉真实数据，轨道号变成
   `220456113668253` 这种荒谬值，整条链边界全错。
 - `SimpleBlock` 的帧头有 flags 字节，`Block`（`BlockGroup` 里那个）**没有**。
   两者偏移不同，Keyframe 位得自己按 VP8 帧首字节 bit0 判断。
+- 损坏文件上 `0x00`-`0x0F` 这类**非法长度标记**和**正好截断在文件尾的元素**很常见，
+  读变长整数必须带边界（`read_vint`）：拿到 `None` 就当链断了、跳到下一个簇候选重新对齐。
+  直接拿 `None` 去算偏移会变成 `TypeError` / `IndexError` 崩栈，用户只看到一屏英文堆栈。
 
 ## 依赖
 
