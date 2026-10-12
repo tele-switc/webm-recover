@@ -201,6 +201,8 @@ def main():
 
     chains, gaps, track_blocks, track_first = [], [], collections.Counter(), {}
     kf_dims, keyframes = collections.Counter(), []
+    kf_tracks = collections.Counter()          # 有 VP8 关键帧证据的轨道（用来认视频轨）
+    inter_like = collections.Counter()         # 帧首字节 bit0=1 的块数（VP8 帧间块的特征）
     p, cur = start, None
     while p < n - 8:
         if mm[p:p + 4] == CID:
@@ -238,6 +240,8 @@ def main():
             flags = mm[body + tks + 2]
             fo, flen = body + tks + 3, body + sv - (body + tks + 3)
             track_blocks[tk] += 1
+            if fo < n and mm[fo] & 0x01:       # 帧首字节 bit0：VP8 帧间块恒为 1，Opus 单帧包恒为 0
+                inter_like[tk] += 1
             if tk not in track_first:
                 track_first[tk] = dict(flags=flags, len=flen, head=bytes(mm[fo:fo + 12]))
             if cur is not None:
@@ -248,6 +252,7 @@ def main():
                 w16 = int.from_bytes(mm[fo + 6:fo + 8], "little")
                 h16 = int.from_bytes(mm[fo + 8:fo + 10], "little")
                 kf_dims[(w16 & 0x3FFF, (w16 >> 14) & 3, h16 & 0x3FFF, (h16 >> 14) & 3)] += 1
+                kf_tracks[tk] += 1
                 keyframes.append((fo, flen, cur["ts"], rts))
             p = body + sv
             continue
@@ -285,25 +290,40 @@ def main():
         H = kf_dims.most_common(1)[0][0][2]
     else:
         W, H = 0, 0
-    # MediaRecorder 的典型写法：轨道 1 = 视频，轨道 2 = 音频（Opus 48kHz 立体声）
-    vtk = [t for t in track_blocks if t != 2]
-    vidtk = max(vtk, key=lambda t: track_blocks[t]) if vtk else 1
+    # 轨道角色靠证据认，不能死守「1 必是视频、2 必是音频」：只开麦的网课/会议录音只有音频轨，
+    # 旧写法会把这条唯一的轨当视频，凭空造一条 VP8 轨，真实音频数据一个都不认。
+    if kf_tracks:                                   # 最硬的证据：轨上有 VP8 关键帧魔数
+        vidtk = max(kf_tracks, key=lambda t: kf_tracks[t])
+    elif len(track_blocks) == 1:                    # 单轨且关键帧随头部一起丢了：看帧首字节特征
+        only = next(iter(track_blocks))
+        vidtk = only if inter_like[only] * 2 >= track_blocks[only] else None
+    else:                                           # 多轨又没证据：沿用 MediaRecorder 的常见排布
+        vtk = [t for t in track_blocks if t != 2]
+        vidtk = max(vtk, key=lambda t: track_blocks[t]) if vtk else None
+    others = [t for t in sorted(track_blocks) if t != vidtk]
+    atk = 2 if 2 in others else (others[0] if len(others) == 1 else None)
     dur = top - base
-    say("判定：视频轨=%d 音频轨=2 分辨率=%dx%d base=%d 时长=%.1fs" % (vidtk, W, H, base, dur / 1000))
+    say("判定：视频轨=%s 音频轨=%s 分辨率=%dx%d base=%d 时长=%.1fs" %
+        (vidtk if vidtk else "无", atk if atk is not None else "无", W, H, base, dur / 1000))
+    if vidtk is None:
+        say(" ！全程没找到 VP8 关键帧证据，按纯音频容器重建。若这段其实有画面，"
+            "说明负载不是 VP8（例如 H.264），本工具不适用。")
 
     ebml = el("1a45dfa3", u("4286", 1) + u("42f7", 1) + u("42f2", 4) + u("42f3", 8) +
               s_("4282", "webm") + u("4287", 2) + u("4285", 1))
     info = el("1549a966", u("2ad7b1", 1000000) + f64("4489", float(dur)) +
               s_("4d80", "recover") + s_("4744", "recover.py") + s_("7ba9", "recovered"))
-    vte = el("ae", u("d7", vidtk) + el("73c5", (1).to_bytes(8, "big")) + u("83", 1) + u("9c", 0) +
-             s_("22b59c", "und") + s_("86", "V_VP8") + el("e0", u("b0", W or 1) + u("ba", H or 1)))
+    # 没有视频证据时不再写视频 TrackEntry（写死 1x1 的假 VP8 轨会让播放器以为有画面）
+    vte = el("ae", u("d7", vidtk) + el("73c5", vidtk.to_bytes(8, "big")) + u("83", 1) + u("9c", 0) +
+             s_("22b59c", "und") + s_("86", "V_VP8") + el("e0", u("b0", W or 1) + u("ba", H or 1))) \
+        if vidtk else b""
     oph = b"OpusHead" + bytes([1, 2]) + struct.pack("<H", 312) + struct.pack("<I", 48000) + \
         struct.pack("<h", 0) + bytes([0])
-    ate = el("ae", u("d7", 2) + el("73c5", (2).to_bytes(8, "big")) + u("83", 2) + u("9c", 0) +
+    ate = el("ae", u("d7", atk) + el("73c5", atk.to_bytes(8, "big")) + u("83", 2) + u("9c", 0) +
              s_("22b59c", "und") + s_("86", "A_OPUS") + u("23e383", 60000000) +
-             el("e1", f64("b5", 48000.0) + u("9f", 2)) + el("63a2", oph))
-    head = ebml + bytes.fromhex("18538067") + UNKNOWN_SEGMENT + info + \
-        el("1654ae6b", vte + (ate if 2 in track_blocks else b""))
+             el("e1", f64("b5", 48000.0) + u("9f", 2)) + el("63a2", oph)) \
+        if atk is not None else b""
+    head = ebml + bytes.fromhex("18538067") + UNKNOWN_SEGMENT + info + el("1654ae6b", vte + ate)
 
     tmp = a.out + ".raw.webm"
     skipped = 0
@@ -369,6 +389,7 @@ def main():
     # 报告里只留文件名，不留调用者的绝对路径
     report = dict(src=os.path.basename(a.src), size=n, head_lost=start, clusters=len(chains),
                   blocks=dict((str(k), v) for k, v in track_blocks.items()),
+                  video_track=vidtk, audio_track=atk,
                   keyframes=len(keyframes), W=W, H=H, ts_base=base, ts_top=top,
                   span_s=(top - base) / 1000, gaps=len(gaps))
     with open(a.out + ".report.json", "w", encoding="utf-8") as jf:
