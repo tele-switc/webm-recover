@@ -24,6 +24,8 @@ import recover as R            # noqa: E402
 import make_sample as M        # noqa: E402
 
 FFMPEG = M.find_ffmpeg() if (os.environ.get("WEBM_RECOVER_FFMPEG") or shutil.which("ffmpeg")) else None
+# ffprobe 跟着 ffmpeg 走：PATH 里有就直接用，没有就取同级目录的那个
+FFPROBE = "ffprobe" if shutil.which("ffprobe") else (FFMPEG.replace("ffmpeg", "ffprobe") if FFMPEG else None)
 
 CID = bytes.fromhex("1f43b675")
 UNKNOWN = bytes.fromhex("01ffffffffffffff")
@@ -158,6 +160,39 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
         self.assertTrue(os.path.exists(png))
         self.assertGreater(os.path.getsize(png), 2000, "解出来的帧太小")
+
+    def test_audio_only_input_recovers_as_audio_only(self):
+        """回归防线：只开麦的网课/会议录音只有音频轨。旧逻辑死守「轨 1 = 视频」，
+        给这种文件凭空造一条 1x1 的 VP8 轨，真实 Opus 数据整条丢掉。"""
+        clean = os.path.join(self.tmp, "clean.webm")
+        self.assertTrue(os.path.exists(clean), "setUp 没有合成出 clean.webm")
+        with open(clean, "rb") as fh:
+            blocks = M.extract_blocks(fh.read())
+        audio = [(ts, 1, rts, flags, frame)
+                 for ts, tk, rts, flags, frame in blocks if tk == 2]
+        self.assertGreater(len(audio), 10, "样本里没有解析出音频块")
+        broken = os.path.join(self.tmp, "aonly.webm")
+        with open(broken, "wb") as f:
+            f.write(os.urandom(2048))               # 被毁的头部
+            f.write(M.build_streaming(audio))
+        out = os.path.join(self.tmp, "aonly_out.webm")
+        rc = run([sys.executable, os.path.join(ROOT, "recover.py"), broken, out])
+        self.assertEqual(rc.returncode, 0, rc.stdout + rc.stderr)
+
+        probe = run([FFPROBE, "-v", "error", "-show_entries", "stream=codec_type",
+                     "-of", "csv=p=0", out])
+        kinds = sorted({ln.strip() for ln in probe.stdout.splitlines() if ln.strip()})
+        self.assertEqual(kinds, ["audio"], "纯音频输入被造出了视频轨: %s" % probe.stdout)
+
+        wav = os.path.join(self.tmp, "aonly.wav")
+        d = run([FFMPEG, "-hide_banner", "-v", "error", "-y", "-i", out, wav])
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        self.assertGreater(os.path.getsize(wav), 20000, "解出的 PCM 太小，音频其实是空的")
+
+        with open(out + ".report.json", encoding="utf-8") as fh:
+            rep = json.load(fh)
+        self.assertIsNone(rep["video_track"])
+        self.assertEqual(rep["audio_track"], 1)
 
     def test_report_contains_no_absolute_source_path(self):
         """隐私：报告里只留文件名，不留调用者的绝对路径。"""
