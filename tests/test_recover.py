@@ -25,11 +25,25 @@ import make_sample as M        # noqa: E402
 
 FFMPEG = M.find_ffmpeg() if (os.environ.get("WEBM_RECOVER_FFMPEG") or shutil.which("ffmpeg")) else None
 
+CID = bytes.fromhex("1f43b675")
+UNKNOWN = bytes.fromhex("01ffffffffffffff")
+
 
 def run(cmd):
     kw = {} if os.name != "nt" else {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", **kw)
+
+
+def crafted(tail, junk=2048):
+    """垃圾头 + 一个合法 unknown-size Cluster（带 E7 时间码）+ 指定尾巴。
+    用来喂各种坏块头：真实损坏文件的特征就是链上随时冒出非法长度标记。"""
+    import random
+    rng = random.Random(7)
+    head = bytes(rng.randrange(256) for _ in range(junk))
+    head = head.replace(CID, b"\x00" * 4)          # 垃圾头里不许有簇 ID，保证起点唯一
+    cluster = CID + UNKNOWN + bytes.fromhex("e7") + b"\x82" + (500).to_bytes(2, "big")
+    return head + cluster + tail
 
 
 class TestEbmlCodec(unittest.TestCase):
@@ -58,6 +72,16 @@ class TestEbmlCodec(unittest.TestCase):
         # f64: ID(2B) + size(1B, 0x88=长度8) + 8B double
         self.assertEqual(R.f64("4489", 1000.0)[:3].hex(), "448988")
         self.assertEqual(len(R.f64("4489", 1000.0)), 11)
+
+    def test_read_vint_is_bounded(self):
+        """read_vint 必须对坏长度标记和越界字段返回 (None, 0)，绝不能抛异常。"""
+        self.assertEqual(R.read_vint(b"\x81\x01", 0, 2), (1, 1))          # 正常
+        self.assertEqual(R.read_vint(b"\x00\x00", 0, 2), (None, 0))       # 非法标记 0x00
+        self.assertEqual(R.read_vint(b"\x0f\x00", 0, 2), (None, 0))       # 非法标记 0x0F
+        self.assertEqual(R.read_vint(b"\x81", 1, 1), (None, 0))           # 起点就是文件尾
+        self.assertEqual(R.read_vint(b"\x01\xff", 0, 2), (None, 0))       # 8 字节长度写到界外
+        self.assertEqual(R.read_vint(b"\x40", 0, 1), (None, 0))           # 2 字节长度只剩 1 字节
+        self.assertEqual(R.read_vint(b"\xc0\x00", 0, 2), (64, 1))         # 1 字节长度（marker 在 bit7）
 
 
 class TestSampleBuilder(unittest.TestCase):
@@ -156,6 +180,29 @@ class TestCli(unittest.TestCase):
         self.assertNotEqual(rc.returncode, 0)
         self.assertIn("源文件不存在", rc.stderr + rc.stdout)
 
+    def test_directory_source_is_clean_error(self):
+        """传了目录应当说人话，不该抛 IsADirectoryError。"""
+        rc = run([sys.executable, os.path.join(ROOT, "recover.py"),
+                  os.path.join(ROOT, "fixtures"), os.path.join(ROOT, "out.webm")])
+        self.assertNotEqual(rc.returncode, 0)
+        self.assertNotIn("Traceback", rc.stderr)
+        self.assertIn("源路径是目录", rc.stderr + rc.stdout)
+
+    def test_missing_output_dir_is_clean_error(self):
+        rc = run([sys.executable, os.path.join(ROOT, "recover.py"),
+                  os.path.join(ROOT, "README.md"),
+                  os.path.join(tempfile.gettempdir(), "webm-no-such-dir", "out.webm")])
+        self.assertNotEqual(rc.returncode, 0)
+        self.assertNotIn("Traceback", rc.stderr)
+        self.assertIn("输出文件的目录不存在", rc.stderr + rc.stdout)
+
+    def test_bad_explicit_ffmpeg_path_is_not_silently_ignored(self):
+        """--ffmpeg 指了个不存在的 exe 必须报错；原先会悄悄改用 PATH 里的另一个 ffmpeg，
+        用户以为自己用的是指定那个。"""
+        with self.assertRaises(SystemExit) as cm:
+            R.find_ffmpeg(os.path.join(tempfile.gettempdir(), "webm-definitely-not-here.exe"))
+        self.assertIn("--ffmpeg", str(cm.exception))
+
     def test_rejects_non_cluster_file(self):
         """不是 MediaRecorder 产物的文件应当以退出码 2 明确拒绝，而不是硬造一个坏文件。"""
         tmp = tempfile.mkdtemp(prefix="webm-cli-")
@@ -166,6 +213,66 @@ class TestCli(unittest.TestCase):
             rc = run([sys.executable, os.path.join(ROOT, "recover.py"), junk,
                       os.path.join(tmp, "o.webm")])
             self.assertEqual(rc.returncode, 2, rc.stdout + rc.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_illegal_vint_and_truncated_tail_do_not_crash(self):
+        """回归防线：链上出现非法长度标记（0x00）或元素正好截断在文件尾时，
+        必须按断点跳过并以退出码 2 收场，不能抛 TypeError / IndexError 崩栈。"""
+        cases = {
+            "A3 后跟非法长度": b"\xa3\x00" + b"\x00" * 7,
+            "E7 后跟非法长度": b"\xe7\x00" + b"\x11" * 40,
+            "块头正好贴着文件尾": b"\xa3\x01" + b"\x00" * 7,
+            "簇头后只剩 E7": b"\xe7",
+        }
+        tmp = tempfile.mkdtemp(prefix="webm-vint-")
+        try:
+            for name, tail in cases.items():
+                src = os.path.join(tmp, "in.webm")
+                with open(src, "wb") as f:
+                    f.write(crafted(tail))
+                rc = run([sys.executable, os.path.join(ROOT, "recover.py"), src,
+                          os.path.join(tmp, "o.webm")])
+                self.assertNotIn("Traceback", rc.stderr, "%s 崩栈" % name)
+                self.assertNotIn("Error", rc.stderr, "%s 有异常: %s" % (name, rc.stderr[-300:]))
+                self.assertEqual(rc.returncode, 2, "%s 退出码应为 2: %s" % (name, rc.stdout))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestDryrun(unittest.TestCase):
+    def test_dryrun_survives_illegal_vint(self):
+        """README 的第一步就是跑 dryrun 体检，坏块头不能让它只吐一句 ERROR。"""
+        tmp = tempfile.mkdtemp(prefix="webm-dry-")
+        try:
+            src = os.path.join(tmp, "in.webm")
+            with open(src, "wb") as f:
+                f.write(crafted(b"\xa3\x00" + b"\x00" * 7 + b"\xe7\x00" + b"\x00" * 20))
+            rc = run([sys.executable, os.path.join(ROOT, "tools", "dryrun.py"), src])
+            out = rc.stdout + rc.stderr
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("ERROR", out, out[-300:])
+            self.assertEqual(rc.returncode, 0)
+            self.assertIn("存活链", out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dryrun_reports_bad_paths_in_words(self):
+        """体检工具对空文件/目录/不存在的路径要给中文结论，不能只剩一句异常文本。"""
+        tmp = tempfile.mkdtemp(prefix="webm-dry2-")
+        try:
+            empty = os.path.join(tmp, "empty.webm")
+            open(empty, "wb").close()
+            rc = run([sys.executable, os.path.join(ROOT, "tools", "dryrun.py"),
+                      empty, os.path.join(tmp, "nope.webm"), tmp])
+            out = rc.stdout + rc.stderr
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("ERROR", out, out[-300:])
+            for msg in ("文件是空的", "文件不存在", "这是目录"):
+                self.assertIn(msg, out)
+            # 不给参数时必须喊用法，而不是默默退 0
+            rc2 = run([sys.executable, os.path.join(ROOT, "tools", "dryrun.py")])
+            self.assertIn("用法", rc2.stdout + rc2.stderr)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
