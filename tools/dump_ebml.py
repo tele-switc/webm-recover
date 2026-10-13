@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 # 把参照 webm 的 EBML 结构完整打印，作为重建时的真实依据（不凭记忆断言 ID/取值）
-import sys
+import os, sys
 
 try:                       # Windows GBK 控制台下打印中文不炸
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+# vint 从 recover.py 导入：EBML 变长整数这条规则全仓库只留一份
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from recover import vint  # noqa: E402
 
 if len(sys.argv) < 2:
     print("用法: python tools/dump_ebml.py <webm文件> [最多扫描字节]")
@@ -34,18 +38,6 @@ NAMES = {
 }
 CONTAINER = {0x1A45DFA3, 0x18538067, 0x1549A966, 0x1654AE6B, 0xAE, 0xE0, 0xE1, 0x1F43B675,
              0xAF, 0x114D9B74, 0x1C53BB6B, 0xBB, 0x1B, 0x73A4, 0x47B5, 0x1254C367}
-
-
-def vint(b, p):
-    x = b[p]
-    for k in range(8):
-        if x & (0x80 >> k):
-            L = k + 1
-            v = x & (0xFF >> L)
-            for q in range(1, L):
-                v = (v << 8) | b[p + q]
-            return v, L
-    return None, 0
 
 
 def walk(b, lo, hi, depth=0, limit=600):

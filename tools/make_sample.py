@@ -29,8 +29,11 @@ import subprocess
 import sys
 import tempfile
 
-CID = bytes.fromhex("1f43b675")           # Cluster
-UNKNOWN = bytes.fromhex("01ffffffffffffff")
+# EBML 的常量与 helper 从 recover.py 导入，全仓库只留一份规则
+# （UNKNOWN 就是"unknown size"那种写法：段和簇都用它，recover.py 里叫 UNKNOWN_SEGMENT）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from recover import CID, enc_size, vint  # noqa: E402
+from recover import UNKNOWN_SEGMENT as UNKNOWN  # noqa: E402
 
 
 def find_ffmpeg():
@@ -44,27 +47,7 @@ def find_ffmpeg():
 
 
 # ---------- EBML 基础 ----------
-
-def vint(b, p):
-    """读 EBML 变长整数（长度标记 + 低位值），返回 (值, 占用字节数)。"""
-    x = b[p]
-    for k in range(8):
-        if x & (0x80 >> k):
-            L = k + 1
-            v = x & (0xFF >> L)
-            for q in range(1, L):
-                v = (v << 8) | b[p + q]
-            return v, L
-    return None, 0
-
-
-def enc_size(v):
-    """把整数写成 EBML 变长表示（长度字段与无符号整数元素通用）。"""
-    for L in range(1, 9):
-        if v < (1 << (7 * L)) - 1:
-            return bytes([(1 << (8 - L)) | (v >> (8 * (L - 1)))]) + \
-                   (v & ((1 << (8 * (L - 1))) - 1)).to_bytes(L - 1, "big")
-    raise ValueError(v)
+# vint / enc_size 从 recover.py 导入（见文件头）
 
 
 def rid(b, p):

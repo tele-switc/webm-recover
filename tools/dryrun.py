@@ -9,19 +9,10 @@ try:                       # Windows GBK 控制台下打印中文不炸
 except Exception:
     pass
 
-CID = bytes.fromhex("1f43b675")
-
-
-def vint(b, p):
-    x = b[p]
-    for k in range(8):
-        if x & (0x80 >> k):
-            L = k + 1
-            v = x & (0xFF >> L)
-            for q in range(1, L):
-                v = (v << 8) | b[p + q]
-            return v, L
-    return None, 0
+# EBML 的规则只留一份：CID 与 vint 从 recover.py 导入。改主脚本时体检工具跟着一起变，
+# 不会出现"主脚本修好了、dryrun 还在用旧规则"的漂移（那正是 README 里写的第一号坑）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from recover import CID, vint  # noqa: E402
 
 
 def read_vint(b, p, n):
